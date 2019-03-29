@@ -121,8 +121,8 @@ protected:
   }
 
   void reconfigureCallback(octomap_server::OctomapServerConfig& config, uint32_t level);
-  void publishBinaryOctoMap(const ros::Time& rostime = ros::Time::now()) const;
-  void publishFullOctoMap(const ros::Time& rostime = ros::Time::now()) const;
+  void publishBinaryOctoMap(const ros::Time& rostime = ros::Time::now(), bool diff=false) const;
+  void publishFullOctoMap(const ros::Time& rostime = ros::Time::now(), bool diff=false) const;
   virtual void publishAll(const ros::Time& rostime = ros::Time::now());
 
   /**
@@ -200,6 +200,8 @@ protected:
   static std_msgs::ColorRGBA heightMapColor(double h);
   ros::NodeHandle m_nh;
   ros::Publisher  m_markerPub, m_binaryMapPub, m_fullMapPub, m_pointCloudPub, m_collisionObjectPub, m_mapPub, m_cmapPub, m_fmapPub, m_fmarkerPub;
+  // MMG: Differential octomap
+  ros::Publisher  m_binaryDiffMapPub, m_fullDiffMapPub;
   message_filters::Subscriber<sensor_msgs::PointCloud2>* m_pointCloudSub;
   tf::MessageFilter<sensor_msgs::PointCloud2>* m_tfPointCloudSub;
   ros::ServiceServer m_octomapBinaryService, m_octomapFullService, m_clearBBXService, m_resetService;
@@ -208,6 +210,7 @@ protected:
   dynamic_reconfigure::Server<OctomapServerConfig> m_reconfigureServer;
 
   OcTreeT* m_octree;
+  OcTreeT* m_octree_diff;
   octomap::KeyRay m_keyRay;  // temp storage for ray casting
   octomap::OcTreeKey m_updateBBXMin;
   octomap::OcTreeKey m_updateBBXMax;

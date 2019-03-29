@@ -45,6 +45,7 @@ OctomapServer::OctomapServer(ros::NodeHandle private_nh_)
   m_tfPointCloudSub(NULL),
   m_reconfigureServer(m_config_mutex),
   m_octree(NULL),
+  m_octree_diff(NULL),
   m_maxRange(-1.0),
   m_worldFrameId("/map"), m_baseFrameId("base_footprint"),
   m_useHeightMap(true),
@@ -138,6 +139,10 @@ OctomapServer::OctomapServer(ros::NodeHandle private_nh_)
   m_treeDepth = m_octree->getTreeDepth();
   m_maxTreeDepth = m_treeDepth;
   m_gridmap.info.resolution = m_res;
+  // MMG: Differential octomap
+  m_octree->enableChangeDetection(true);
+  m_octree_diff = new OcTreeT(m_res);
+  // BUG: *m_octree_diff = *m_octree;
 
   double r, g, b, a;
   private_nh.param("color/r", r, 0.0);
@@ -172,6 +177,9 @@ OctomapServer::OctomapServer(ros::NodeHandle private_nh_)
   m_pointCloudPub = m_nh.advertise<sensor_msgs::PointCloud2>("octomap_point_cloud_centers", 1, m_latchedTopics);
   m_mapPub = m_nh.advertise<nav_msgs::OccupancyGrid>("projected_map", 5, m_latchedTopics);
   m_fmarkerPub = m_nh.advertise<visualization_msgs::MarkerArray>("free_cells_vis_array", 1, m_latchedTopics);
+  // MMG: Differential octomap
+  m_binaryDiffMapPub = m_nh.advertise<Octomap>("octomap_diff_binary", 1, m_latchedTopics);
+  m_fullDiffMapPub = m_nh.advertise<Octomap>("octomap_diff_full", 1, m_latchedTopics);
 
   m_pointCloudSub = new message_filters::Subscriber<sensor_msgs::PointCloud2> (m_nh, "cloud_in", 5);
   m_tfPointCloudSub = new tf::MessageFilter<sensor_msgs::PointCloud2> (*m_pointCloudSub, m_tfListener, m_worldFrameId, 5);
@@ -204,6 +212,12 @@ OctomapServer::~OctomapServer(){
     m_octree = NULL;
   }
 
+  // MMG: Differential octomap
+  if (m_octree_diff){
+    delete m_octree_diff;
+    m_octree_diff = NULL;
+  }
+
 }
 
 bool OctomapServer::openFile(const std::string& filename){
@@ -211,26 +225,45 @@ bool OctomapServer::openFile(const std::string& filename){
     return false;
 
   std::string suffix = filename.substr(filename.length()-3, 3);
-  if (suffix== ".bt"){
-    if (!m_octree->readBinary(filename)){
+  if (suffix== ".bt")
+  {
+    if (!m_octree->readBinary(filename))
+    {
       return false;
     }
-  } else if (suffix == ".ot"){
+  } 
+  else if (suffix == ".ot")
+  {
     AbstractOcTree* tree = AbstractOcTree::read(filename);
     if (!tree){
       return false;
     }
-    if (m_octree){
+    if (m_octree)
+    {
       delete m_octree;
       m_octree = NULL;
     }
     m_octree = dynamic_cast<OcTreeT*>(tree);
-    if (!m_octree){
+    if (!m_octree)
+    {
       ROS_ERROR("Could not read OcTree in file, currently there are no other types supported in .ot");
       return false;
     }
-
-  } else{
+    else
+    {
+      // MMG: Differential octomap
+      // NOTE:  If diff is actually computing the difference between previous and next
+      if(m_octree_diff)
+      {
+        delete m_octree_diff;
+        m_octree_diff = NULL;
+      }
+      // BUG: *m_octree_diff = *m_octree;
+    }
+    
+  }
+  else
+  {
     return false;
   }
 
@@ -353,7 +386,8 @@ void OctomapServer::insertCloudCallback(const sensor_msgs::PointCloud2::ConstPtr
   publishAll(cloud->header.stamp);
 }
 
-void OctomapServer::insertScan(const tf::Point& sensorOriginTf, const PCLPointCloud& ground, const PCLPointCloud& nonground){
+void OctomapServer::insertScan(const tf::Point& sensorOriginTf, const PCLPointCloud& ground, const PCLPointCloud& nonground)
+{
   point3d sensorOrigin = pointTfToOctomap(sensorOriginTf);
 
   if (!m_octree->coordToKeyChecked(sensorOrigin, m_updateBBXMin)
@@ -362,9 +396,9 @@ void OctomapServer::insertScan(const tf::Point& sensorOriginTf, const PCLPointCl
     ROS_ERROR_STREAM("Could not generate Key for origin "<<sensorOrigin);
   }
 
-#ifdef COLOR_OCTOMAP_SERVER
-  unsigned char* colors = new unsigned char[3];
-#endif
+  #ifdef COLOR_OCTOMAP_SERVER
+    unsigned char* colors = new unsigned char[3];
+  #endif
 
   // instead of direct scan insertion, compute update to filter ground:
   KeySet free_cells, occupied_cells;
@@ -470,6 +504,17 @@ void OctomapServer::insertScan(const tf::Point& sensorOriginTf, const PCLPointCl
   if (m_compressMap)
     m_octree->prune();
 
+  // MMG: traverse changes and update octree diff
+  m_octree_diff->clear();
+  for (KeyBoolMap::const_iterator it = m_octree->changedKeysBegin(); it != m_octree->changedKeysEnd(); ++it)
+  {
+    OcTreeKey node_key = it->first;
+    OcTreeNode* node = m_octree->search(node_key);
+    float logodds = node->getLogOdds();
+    m_octree_diff->updateNode(node_key,logodds);
+  }
+  m_octree->resetChangeDetection();
+
 #ifdef COLOR_OCTOMAP_SERVER
   if (colors)
   {
@@ -495,6 +540,9 @@ void OctomapServer::publishAll(const ros::Time& rostime){
   bool publishPointCloud = (m_latchedTopics || m_pointCloudPub.getNumSubscribers() > 0);
   bool publishBinaryMap = (m_latchedTopics || m_binaryMapPub.getNumSubscribers() > 0);
   bool publishFullMap = (m_latchedTopics || m_fullMapPub.getNumSubscribers() > 0);
+  // MMG: Differential Octomap
+  bool publishBinaryDiffMap = (m_latchedTopics || m_binaryDiffMapPub.getNumSubscribers() > 0);
+  bool publishFullDiffMap = (m_latchedTopics || m_fullDiffMapPub.getNumSubscribers() > 0);
   m_publish2DMap = (m_latchedTopics || m_mapPub.getNumSubscribers() > 0);
 
   // init markers for free space:
@@ -693,6 +741,13 @@ void OctomapServer::publishAll(const ros::Time& rostime){
   if (publishFullMap)
     publishFullOctoMap(rostime);
 
+  // MMG: Differential Octomap
+  if (publishBinaryDiffMap)
+    publishBinaryOctoMap(rostime, true);
+
+  if (publishFullDiffMap)
+    publishFullOctoMap(rostime, true);
+
 
   double total_elapsed = (ros::WallTime::now() - startTime).toSec();
   ROS_DEBUG("Map publishing in OctomapServer took %f sec", total_elapsed);
@@ -794,28 +849,51 @@ bool OctomapServer::resetSrv(std_srvs::Empty::Request& req, std_srvs::Empty::Res
   return true;
 }
 
-void OctomapServer::publishBinaryOctoMap(const ros::Time& rostime) const{
+void OctomapServer::publishBinaryOctoMap(const ros::Time& rostime, bool diff) const{
 
   Octomap map;
   map.header.frame_id = m_worldFrameId;
   map.header.stamp = rostime;
 
-  if (octomap_msgs::binaryMapToMsg(*m_octree, map))
-    m_binaryMapPub.publish(map);
+  // MMG: Differential octomap
+  if(!diff)
+  {
+    if (octomap_msgs::binaryMapToMsg(*m_octree, map))
+      m_binaryMapPub.publish(map);
+    else
+      ROS_ERROR("Error serializing OctoMap Binary");
+  }
   else
-    ROS_ERROR("Error serializing OctoMap");
+  {
+    if (octomap_msgs::binaryMapToMsg(*m_octree_diff, map))
+      m_binaryDiffMapPub.publish(map);
+    else
+      ROS_ERROR("Error serializing OctoMap Binary Diff");
+  }
+  
 }
 
-void OctomapServer::publishFullOctoMap(const ros::Time& rostime) const{
+void OctomapServer::publishFullOctoMap(const ros::Time& rostime, bool diff) const{
 
   Octomap map;
   map.header.frame_id = m_worldFrameId;
   map.header.stamp = rostime;
 
-  if (octomap_msgs::fullMapToMsg(*m_octree, map))
-    m_fullMapPub.publish(map);
+  // MMG: Differential octomap
+  if(!diff)
+  {
+    if (octomap_msgs::fullMapToMsg(*m_octree, map))
+      m_fullMapPub.publish(map);
+    else
+      ROS_ERROR("Error serializing OctoMap Full");
+  }
   else
-    ROS_ERROR("Error serializing OctoMap");
+  {
+    if (octomap_msgs::fullMapToMsg(*m_octree_diff, map))
+      m_fullDiffMapPub.publish(map);
+    else
+      ROS_ERROR("Error serializing OctoMap Full Diff");
+  }
 
 }
 
